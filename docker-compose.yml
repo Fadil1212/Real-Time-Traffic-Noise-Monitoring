@@ -1,0 +1,285 @@
+services:
+  # Zookeeper - Required for Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - traffic-noise-network
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+
+  # Kafka - Message Streaming Platform
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9093:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - traffic-noise-network
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  # PostgreSQL with TimescaleDB Extension
+  postgres:
+    image: timescale/timescaledb:latest-pg15
+    container_name: postgres-timescaledb
+    environment:
+      POSTGRES_USER: traffic_user
+      POSTGRES_PASSWORD: traffic_pass
+      POSTGRES_DB: traffic_noise_db
+    ports:
+      - "5432:5432"
+    networks:
+      - traffic-noise-network
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U traffic_user -d traffic_noise_db" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Spark Master (Apache Spark Official)
+  spark-master:
+    image: apache/spark:3.5.0
+    container_name: spark-master
+    user: root
+    environment:
+      - SPARK_MASTER_HOST=0.0.0.0
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+    ports:
+      - "8080:8080" # Spark Master Web UI
+      - "7077:7077" # Spark Master Port
+    networks:
+      - traffic-noise-network
+    volumes:
+      - ./spark-apps:/opt/spark/work-dir
+      - ./spark-data:/tmp/spark-events
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+
+  # Spark Worker (Apache Spark Official)
+  spark-worker:
+    image: apache/spark:3.5.0
+    container_name: spark-worker
+    user: root
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_WEBUI_PORT=8081
+    ports:
+      - "8081:8081" # Spark Worker Web UI
+    networks:
+      - traffic-noise-network
+    volumes:
+      - ./spark-apps:/opt/spark/work-dir
+      - ./spark-data:/tmp/spark-events
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+
+  # Jupyter Notebook for Development
+  jupyter:
+    image: jupyter/all-spark-notebook:latest
+    container_name: jupyter-notebook
+    depends_on:
+      - postgres
+      - kafka
+      - spark-master
+    ports:
+      - "8888:8888"
+    environment:
+      JUPYTER_ENABLE_LAB: "yes"
+      GRANT_SUDO: "yes"
+    networks:
+      - traffic-noise-network
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ./spark-apps:/home/jovyan/spark-apps
+      - ./data:/home/jovyan/data
+    command: start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
+
+  # Streamlit Dashboard
+  streamlit:
+    build:
+      context: ./streamlit-app
+      dockerfile: Dockerfile
+    container_name: streamlit-dashboard
+    depends_on:
+      - postgres
+      - kafka
+    ports:
+      - "8501:8501"
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=traffic_user
+      - POSTGRES_PASSWORD=traffic_pass
+      - POSTGRES_DB=traffic_noise_db
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+    networks:
+      - traffic-noise-network
+    volumes:
+      - ./streamlit-app:/app
+      - ./.streamlit:/app/.streamlit
+      - ./data:/app/data
+    command: streamlit run app.py --server.address=0.0.0.0
+
+  kafka-producer:
+    build:
+      context: ./kafka-producer
+      dockerfile: Dockerfile
+    container_name: kafka-producer
+    depends_on:
+      - kafka
+    environment:
+      - NUM_SENSORS=50
+      - KAFKA_BROKER=kafka:29092
+      - TOPIC_NAME=noise-readings
+      - SEND_INTERVAL=5
+    networks:
+      - traffic-noise-network
+    volumes:
+      - ./kafka-producer:/app
+    restart: unless-stopped
+
+  # Spark Consumer (Integrated: Streaming + Road-Bound Route Analysis)
+  spark-consumer:
+    build:
+      context: ./spark-apps
+      dockerfile: Dockerfile
+    container_name: spark-consumer
+    depends_on:
+      - kafka
+      - postgres
+    environment:
+      - SPARK_MASTER=local[2]
+    networks:
+      - traffic-noise-network
+    volumes:
+      - ./osm_cache:/root/.osmnx # Cache OSM data
+    restart: on-failure
+
+  correlation-analyzer:
+    build:
+      context: ./correlation-analyzer
+      dockerfile: Dockerfile
+    container_name: correlation-analyzer
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=traffic_noise_db
+      - DB_USER=traffic_user
+      - DB_PASSWORD=traffic_pass
+      - RUN_INTERVAL=300 # 5 minutes
+      - ANALYSIS_WINDOW=1 # 1 hour
+    networks:
+      - traffic-noise-network
+    volumes:
+      - ./utils:/app/utils:ro
+      - ./models:/app/models:ro
+      - ./correlation-analyzer/correlation_analyzer.py:/app/correlation_analyzer.py:ro
+    restart: unless-stopped
+
+  # Noise Predictor Service
+  noise-predictor:
+    build:
+      context: ./noise-predictor
+      dockerfile: Dockerfile
+    container_name: noise-predictor
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=traffic_noise_db
+      - DB_USER=traffic_user
+      - DB_PASSWORD=traffic_pass
+      - MODEL_PATH=/app/models/rf_model
+      - RUN_INTERVAL=900 # 15 minutes (900 seconds)
+    networks:
+      - traffic-noise-network
+    volumes:
+      - ./models:/app/models:ro # Mount models directory (read-only)
+    restart: unless-stopped
+
+  # Stress Zone Predictor Service
+  stress-zone-predictor:
+    build:
+      context: ./stress-zone-predictor
+      dockerfile: Dockerfile
+    container_name: stress-zone-predictor
+    depends_on:
+      postgres:
+        condition: service_healthy
+      noise-predictor:
+        condition: service_started # Wait for noise predictor to start
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=traffic_noise_db
+      - DB_USER=traffic_user
+      - DB_PASSWORD=traffic_pass
+      - RUN_INTERVAL=900 # 15 minutes (900 seconds)
+      - DELAY_START=60 # Wait 1 minute after noise predictor
+    networks:
+      - traffic-noise-network
+    volumes:
+      - ./utils:/app/utils:ro # Mount utils for sentiment analyzer
+      - ./models:/app/models:ro # Mount models directory (read-only)
+    restart: unless-stopped
+
+  # Alternative Routes API Service
+  alternative-routes-api:
+    build:
+      context: ./route-recommendation
+      dockerfile: Dockerfile
+    container_name: alternative-routes-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=traffic_noise_db
+      - DB_USER=traffic_user
+      - DB_PASSWORD=traffic_pass
+    ports:
+      - "5000:5000" # Flask API port
+    networks:
+      - traffic-noise-network
+    restart: unless-stopped
+
+networks:
+  traffic-noise-network:
+    driver: bridge
+
+volumes:
+  zookeeper-data:
+  zookeeper-logs:
+  kafka-data:
+  postgres-data:
